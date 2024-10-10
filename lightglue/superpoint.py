@@ -49,7 +49,7 @@ from torch import nn
 from .utils import Extractor
 
 
-def simple_nms(scores, nms_radius: int):
+def simple_nms(scores, nms_radius: int, add_supp: bool):
     """Fast Non-maximum suppression to remove nearby points"""
     assert nms_radius >= 0
 
@@ -58,19 +58,28 @@ def simple_nms(scores, nms_radius: int):
             x, kernel_size=nms_radius * 2 + 1, stride=1, padding=nms_radius
         )
 
+    supp_num = 2 if add_supp else 0
+
     zeros = torch.zeros_like(scores)
+    # ---
     max_mask = scores == max_pool(scores)
-    for _ in range(2):
+    # ---
+    for _ in range(supp_num):
+        # ---
         supp_mask = max_pool(max_mask.float()) > 0
         supp_scores = torch.where(supp_mask, zeros, scores)
+        # ---
         new_max_mask = supp_scores == max_pool(supp_scores)
         max_mask = max_mask | (new_max_mask & (~supp_mask))
+        # ---
     return torch.where(max_mask, scores, zeros)
 
 
 def top_k_keypoints(keypoints, scores, k):
     if k >= len(keypoints):
-        return keypoints, scores
+        # print("k >= len(keypoints)")
+        scores, indices = torch.sort(scores, descending=True)
+        return keypoints[indices], scores
     scores, indices = torch.topk(scores, k, dim=0, sorted=True)
     return keypoints[indices], scores
 
@@ -78,20 +87,47 @@ def top_k_keypoints(keypoints, scores, k):
 def sample_descriptors(keypoints, descriptors, s: int = 8):
     """Interpolate descriptors at keypoint locations"""
     b, c, h, w = descriptors.shape
+
+    # keypointsA = keypoints
+    # keypointsA = torch.round(keypointsA).to(torch.int32)
+    # print(f"keypointsA {keypointsA}")
+    # keypointsA = keypointsA // s
+    # print(f"keypointsA2 {keypointsA}")
+    # for i in range(keypointsA.shape[1]):
+    #     pt = keypointsA[0, i, :]
+    #     desc = descriptors[0, :, pt[1], pt[0]]
+    #     print(desc[:10])
+
+    # print(f"keypoints {keypoints}")
     keypoints = keypoints - s / 2 + 0.5
+    # print(f"keypoints2 {keypoints}")
     keypoints /= torch.tensor(
         [(w * s - s / 2 - 0.5), (h * s - s / 2 - 0.5)],
     ).to(
         keypoints
     )[None]
+    # print(f"keypoints3 {keypoints}")
     keypoints = keypoints * 2 - 1  # normalize to (-1, 1)
+    # print(f"keypoints4 {keypoints}")
+
+    # print(f"desc(0,0) {descriptors[0, :10, 0, 0]}")
+    # print(f"desc(h-1,w-1) {descriptors[0, :10, h-1, w-1]}")
+    # print(f"desc(0,w/2) {descriptors[0, :10, 0, w // 2]}")
+    # print(f"desc(0,w/2-1) {descriptors[0, :10, 0, w // 2 - 1]}")
+    # print(f"desc(0,w-1) {descriptors[0, :10, 0, w-1]}")
+    # print(f"desc(h-1,0) {descriptors[0, :10, h-1, 0]}")
+    # keypoints[:, :, 0] = 0.0
+    # keypoints[:, :, 1] = -1.0
+
     args = {"align_corners": True} if torch.__version__ >= "1.3" else {}
     descriptors = torch.nn.functional.grid_sample(
         descriptors, keypoints.view(b, 1, -1, 2), mode="bilinear", **args
     )
+    # print(f"descriptors {descriptors}")
     descriptors = torch.nn.functional.normalize(
         descriptors.reshape(b, c, -1), p=2, dim=1
     )
+    # print(f"descriptors2 {descriptors}")
     return descriptors
 
 
@@ -110,6 +146,8 @@ class SuperPoint(Extractor):
         "max_num_keypoints": None,
         "detection_threshold": 0.0005,
         "remove_borders": 4,
+        "nms_supp": True,
+        "antialias": True,
     }
 
     preprocess_conf = {
@@ -152,6 +190,9 @@ class SuperPoint(Extractor):
         for key in self.required_data_keys:
             assert key in data, f"Missing key {key} in data"
         image = data["image"]
+
+        input_image = image
+
         if image.shape[1] == 3:
             image = rgb_to_grayscale(image)
 
@@ -175,7 +216,8 @@ class SuperPoint(Extractor):
         b, _, h, w = scores.shape
         scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
         scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h * 8, w * 8)
-        scores = simple_nms(scores, self.conf.nms_radius)
+        score_map = scores
+        scores = simple_nms(scores, self.conf.nms_radius, self.conf.nms_supp)
 
         # Discard keypoints near the image borders
         if self.conf.remove_borders:
@@ -188,6 +230,8 @@ class SuperPoint(Extractor):
         # Extract keypoints
         best_kp = torch.where(scores > self.conf.detection_threshold)
         scores = scores[best_kp]
+
+        # print(f"best_kp size {scores.shape}")
 
         # Separate into batches
         keypoints = [
@@ -213,6 +257,7 @@ class SuperPoint(Extractor):
         cDa = self.relu(self.convDa(x))
         descriptors = self.convDb(cDa)
         descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
+        descriptor_map = descriptors
 
         # Extract descriptors
         descriptors = [
@@ -221,6 +266,9 @@ class SuperPoint(Extractor):
         ]
 
         return {
+            "input_image": input_image,
+            "score_map": score_map,
+            "descriptor_map": torch.permute(descriptor_map, (0, 2, 3, 1)).contiguous(),
             "keypoints": torch.stack(keypoints, 0),
             "keypoint_scores": torch.stack(scores, 0),
             "descriptors": torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
